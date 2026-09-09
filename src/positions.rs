@@ -481,18 +481,70 @@ pub async fn run_pnl(
     info!("subscribed to Rithmic PnL updates (read-only)");
 
     let mut receiver = handle.subscription_receiver.resubscribe();
+
+    // Diagnostics for a stream that has never produced a row.
+    //
+    // `/positions` has reported account:"" and count:0 since this reader was
+    // built, while login and subscribe both succeed and the snapshot request
+    // returns Ok. The loop below could not say WHICH of the two possible causes
+    // it was, because both were silent: a non-connection error was `continue`d
+    // without a log, and any message variant we do not map hit `_ => {}` and
+    // vanished. "Receiving nothing" and "receiving something unrecognised" are
+    // completely different bugs and looked identical from outside.
+    //
+    // Counted locally rather than on ConnectorState: this is the only consumer,
+    // and a periodic summary keeps a chatty stream from flooding the log.
+    let mut n_total: u64 = 0;
+    let mut n_instrument: u64 = 0;
+    let mut n_account: u64 = 0;
+    let mut n_errors: u64 = 0;
+    let mut n_unhandled: u64 = 0;
+    // First few of each kind are logged in full; the rest only in the summary.
+    const VERBOSE_FIRST: u64 = 5;
+    const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+    let mut last_report = std::time::Instant::now();
+
     loop {
+        if last_report.elapsed() >= REPORT_EVERY {
+            // Logged even when everything is zero. A flat account legitimately
+            // produces no INSTRUMENT rows, so silence is not itself a fault —
+            // but silence that is never reported is indistinguishable from a
+            // reader that died, which is the failure mode this whole file keeps
+            // reproducing.
+            info!(
+                total = n_total,
+                instrument_updates = n_instrument,
+                account_updates = n_account,
+                errors = n_errors,
+                unhandled = n_unhandled,
+                "PnL stream summary (last 60s window is cumulative since login)"
+            );
+            last_report = std::time::Instant::now();
+        }
         match receiver.recv().await {
             Ok(resp) => {
+                n_total += 1;
                 if let Some(err) = &resp.error {
                     if err.is_connection_issue() {
                         warn!(error = %err, "connection issue on PnL stream — stopping loop");
                         break;
                     }
+                    n_errors += 1;
+                    // A rejection from Rithmic — "account not found", a
+                    // permission problem — arrives here. Discarding it silently
+                    // is why the cause of an empty book was never visible.
+                    if n_errors <= VERBOSE_FIRST {
+                        warn!(
+                            error = %err,
+                            n_errors,
+                            "PnL stream returned an error (not a connection issue)"
+                        );
+                    }
                     continue;
                 }
                 match resp.message {
                     RithmicMessage::InstrumentPnLPositionUpdate(u) => {
+                        n_instrument += 1;
                         if let Some(snap) = map_instrument_update(&u) {
                             info!(
                                 symbol = %snap.symbol,
@@ -504,9 +556,21 @@ pub async fn run_pnl(
                         }
                     }
                     RithmicMessage::AccountPnLPositionUpdate(a) => {
+                        n_account += 1;
                         book.set_account(map_account_update(&a));
                     }
-                    _ => {}
+                    ref other => {
+                        n_unhandled += 1;
+                        // Truncated: enough to identify the variant without
+                        // dumping a full account payload into the log.
+                        if n_unhandled <= VERBOSE_FIRST {
+                            let dbg = format!("{other:?}");
+                            info!(
+                                variant = &dbg[..dbg.len().min(160)],
+                                n_unhandled, "PnL stream message not mapped by this reader"
+                            );
+                        }
+                    }
                 }
             }
             Err(RecvError::Lagged(n)) => {

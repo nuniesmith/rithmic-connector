@@ -680,9 +680,8 @@ mod contention_tests {
     /// The exact string rithmic_rs produced live on 2026-09-09.
     #[test]
     fn the_real_rejection_is_classified_as_contention() {
-        let e = anyhow::anyhow!(
-            "ticker plant login failed: request rejected: [13] permission denied"
-        );
+        let e =
+            anyhow::anyhow!("ticker plant login failed: request rejected: [13] permission denied");
         assert!(is_session_contention(&e));
     }
 
@@ -735,6 +734,9 @@ mod contention_tests {
             body.contains("operator: trading on the phone"),
             "the original reason must survive: {body}"
         );
-        assert!(!body.contains("AUTO("), "must not be relabelled automatic: {body}");
+        assert!(
+            !body.contains("AUTO("),
+            "must not be relabelled automatic: {body}"
+        );
     }
 }
