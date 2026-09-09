@@ -315,6 +315,13 @@ async fn run_ready(
                     stolen_in_a_row += 1;
                     if stolen_in_a_row >= MAX_STOLEN_IN_A_ROW {
                         state.set_connected(false);
+                        arm_kill_for_contention(
+                            &kill,
+                            &format!(
+                                "session revoked {MAX_STOLEN_IN_A_ROW}x in a row after <{STOLEN_SESSION_SECS}s"
+                            ),
+                        );
+                        state.set_killed(true);
                         return Err(anyhow::anyhow!(
                             "session revoked {MAX_STOLEN_IN_A_ROW}x in a row after <{STOLEN_SESSION_SECS}s \
                              — another login is using these credentials (Rithmic allows ONE session per \
@@ -338,11 +345,70 @@ async fn run_ready(
                 // Never established (connect/login/subscribe). Retrying a
                 // rejected login is the hammer loop; surface it and stop.
                 state.set_connected(false);
+                // `[13] permission denied` here is the SAME contention as a
+                // revoked session, just caught one step earlier — the other
+                // login got in first. Arm for the same reason: without it the
+                // restart policy turns this into the login war too.
+                if is_session_contention(&e) {
+                    arm_kill_for_contention(&kill, "login refused: [13] permission denied");
+                    state.set_killed(true);
+                }
                 return Err(e);
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(BACKOFF_MAX_SECS);
+    }
+}
+
+/// True when this failure is another login holding the Rithmic credential.
+///
+/// Rithmic reports contention as rp_code `13`, `permission denied`, on the plant
+/// login. It is not a transport fault and it is not an entitlement problem — a
+/// past misdiagnosis cost a day chasing CME exchange permissions when the real
+/// answer was that the operator's own phone had the session.
+///
+/// Matched on the message rather than a type because the code arrives from
+/// `rithmic_rs` as a stringly-typed `RithmicRequestError`; the whole chain is
+/// searched so the classification survives being wrapped in context.
+pub fn is_session_contention(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| {
+        c.to_string()
+            .to_ascii_lowercase()
+            .contains("permission denied")
+    })
+}
+
+/// Arm the kill switch because another login has the credential.
+///
+/// # Why arm rather than just exit
+///
+/// The supervisor already stops rather than login-warring. That was defeated the
+/// moment the exit status became honest (2026-09-08, so a dead connector could no
+/// longer masquerade as `Exited (0)`): Docker's `restart: on-failure` retries on
+/// ANY non-zero status, so the deliberate stop was restarted straight back into
+/// the fight. Observed live 2026-09-09 — three full login/revoke cycles in under
+/// two seconds, each one kicking the operator off their phone.
+///
+/// Docker's restart policy cannot filter by exit code, so the process cannot
+/// signal "do not restart me" that way. The durable kill switch can: a restarted
+/// container reads the sentinel and holds off. One restart cycle, then quiet.
+///
+/// The exit status stays honest — this fixes the war without re-creating the
+/// silent death it replaced.
+fn arm_kill_for_contention(kill: &crate::killswitch::KillSwitch, detail: &str) {
+    // Idempotent, and it preserves an existing reason — if the OPERATOR set the
+    // switch, their reason and timestamp survive rather than being overwritten
+    // by ours.
+    let reason = format!(
+        "AUTO(session-contention): {detail} — armed by the connector so a restart \
+         does not re-enter the login war. Close the other Rithmic session, then resume."
+    );
+    if let Err(e) = kill.kill(&reason) {
+        // Best effort. If the sentinel cannot be written we still return the
+        // error; the operator sees a restart loop, which is the old behaviour,
+        // not something worse.
+        tracing::error!(error = %e, "could not arm the kill switch after session contention");
     }
 }
 
@@ -596,5 +662,79 @@ mod tests {
         .await
         .unwrap();
         assert!(!state.snapshot().connected);
+    }
+}
+
+#[cfg(test)]
+mod contention_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("fks-contention-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        p.push("rithmic.kill");
+        p
+    }
+
+    /// The exact string rithmic_rs produced live on 2026-09-09.
+    #[test]
+    fn the_real_rejection_is_classified_as_contention() {
+        let e = anyhow::anyhow!(
+            "ticker plant login failed: request rejected: [13] permission denied"
+        );
+        assert!(is_session_contention(&e));
+    }
+
+    /// It must survive being wrapped — the supervisor adds context on the way up,
+    /// and a classifier that only reads the outermost message would miss it.
+    #[test]
+    fn contention_is_found_through_context_wrapping() {
+        use anyhow::Context;
+        let inner: anyhow::Result<()> =
+            Err(anyhow::anyhow!("request rejected: [13] permission denied"));
+        let wrapped = inner.context("connector task failed").unwrap_err();
+        assert!(is_session_contention(&wrapped));
+    }
+
+    /// A network drop must NOT arm the kill switch. Arming on every failure would
+    /// mean one flaky moment silently halts the feed until someone notices.
+    #[test]
+    fn an_ordinary_failure_is_not_contention() {
+        assert!(!is_session_contention(&anyhow::anyhow!(
+            "websocket: connection reset by peer"
+        )));
+        assert!(!is_session_contention(&anyhow::anyhow!(
+            "subscribe failed: unknown symbol"
+        )));
+    }
+
+    #[test]
+    fn arming_writes_a_sentinel_that_says_it_was_automatic() {
+        let k = crate::killswitch::KillSwitch::with_path(tmp("arms"));
+        assert!(!k.is_killed());
+        arm_kill_for_contention(&k, "session revoked 3x in a row");
+        assert!(k.is_killed(), "a restart must find the switch set");
+        let body = k.details().unwrap();
+        assert!(
+            body.contains("AUTO(session-contention)"),
+            "the operator must be able to tell this apart from a kill they set: {body}"
+        );
+        assert!(body.contains("session revoked 3x in a row"), "{body}");
+    }
+
+    /// If the operator killed the session deliberately and contention happens
+    /// anyway, THEIR reason and timestamp are the record that matters.
+    #[test]
+    fn arming_never_overwrites_an_operator_kill() {
+        let k = crate::killswitch::KillSwitch::with_path(tmp("preserve"));
+        k.kill("operator: trading on the phone").unwrap();
+        arm_kill_for_contention(&k, "session revoked 3x in a row");
+        let body = k.details().unwrap();
+        assert!(
+            body.contains("operator: trading on the phone"),
+            "the original reason must survive: {body}"
+        );
+        assert!(!body.contains("AUTO("), "must not be relabelled automatic: {body}");
     }
 }
