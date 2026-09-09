@@ -1,0 +1,87 @@
+# ============================================================================
+# rithmic-connector — nested workspace (own dep universe, independent of fks root)
+#
+# Foundation / skeleton of the credential-gated, READ-ONLY Rithmic connector
+# (roadmap P12; design in docs/architecture/RITHMIC_INTEGRATION_SPIKE.md).
+#
+# DOCTRINE: read-only by construction. This crate speaks only the Ticker /
+# History / PnL plants of Rithmic's R|Protocol API. The ORDER plant (execution)
+# is NEVER opened — there is intentionally no order-entry code path anywhere in
+# this crate. See CLAUDE.md "no autonomous execution".
+#
+# Like `crates/spawner`, this is a standalone crate with its own `[workspace]`
+# block so cargo does NOT auto-attach it to the parent fks virtual workspace
+# (which only carries `src/proto`). Deps are pinned to explicit versions for the
+# same reason — it can be lifted into its own repo later with no reshuffling.
+# ============================================================================
+[workspace]
+
+[package]
+name = "rithmic-connector"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+description = "FKS Rithmic Connector — credential-gated, READ-ONLY futures market-data sidecar (R|Protocol via rithmic-rs)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "rithmic_connector"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rithmic-connector"
+path = "src/main.rs"
+
+[[bin]]
+name = "rithmic-history"
+path = "src/bin/rithmic-history.rs"
+required-features = ["live-connect"]
+
+[features]
+# `live-connect` (default) pulls in the rithmic-rs client and compiles the real
+# TLS-WebSocket connect path. Turn it off (`--no-default-features`) to build the
+# gate/config/health skeleton without the native-tls/openssl toolchain — useful
+# on minimal CI images. The runtime feature gate (RITHMIC_ENABLED) is separate:
+# even with `live-connect` compiled in, the connector no-ops unless enabled AND
+# credentialed.
+default = ["live-connect"]
+live-connect = ["dep:rithmic-rs"]
+
+[dependencies]
+# Async runtime
+# net + io-util are required by the QuestDB ILP writer (TcpStream/AsyncWriteExt)
+# independently of the `live-connect` feature, so they are declared here rather
+# than relied on transitively via rithmic-rs.
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "io-util"] }
+
+# HTTP server (health/status surface — FKS bot contract style)
+axum = { version = "0.8", features = ["macros"] }
+
+# Serialisation (status payloads)
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Observability
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling — anyhow in the binary, thiserror in the library surface
+anyhow    = "1.0"
+thiserror = "2.0"
+
+# Timestamps (candle bucketing in the persistence stub)
+chrono = { version = "0.4", features = ["serde"] }
+# ET wall-clock for the end-of-day rollover; chrono-tz embeds the IANA db so
+# the DST boundary is correct without OS tzdata in the container.
+chrono-tz = "0.10"
+
+# Rithmic R|Protocol client (community crate; MIT OR Apache-2.0).
+# Verified viable against the real 2.0.0 API surface — see README "Viability".
+# Optional so the skeleton compiles without the native-tls toolchain.
+rithmic-rs = { version = "2.0.0", optional = true }
+
+[dev-dependencies]
+# Tests spin up a stand-in TCP listener for QuestDB's ILP port (net + io-util)
+# and poll metrics with a short sleep (time).
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
