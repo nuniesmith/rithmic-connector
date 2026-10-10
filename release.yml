@@ -1,0 +1,48 @@
+name: Release crate
+
+on:
+  workflow_dispatch:
+    inputs:
+      new-version:
+        description: "New version, e.g. 1.2.3"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  MANIFEST_DIR: "."
+  WORKSPACE_MODE: "false"
+  INTERNAL_CRATES: ""
+  TAG_PREFIX: "v"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version
+        uses: nuniesmith/actions/.github/actions/crate-version-bump@v1
+        with:
+          new-version: ${{ inputs.new-version }}
+          manifest-dir: ${{ env.MANIFEST_DIR }}
+          workspace-mode: ${{ env.WORKSPACE_MODE }}
+          internal-crates: ${{ env.INTERNAL_CRATES }}
+
+      - name: Commit, tag and push
+        run: |
+          set -euo pipefail
+          TAG="${{ env.TAG_PREFIX }}${{ inputs.new-version }}"
+          git add -A
+          git commit -m "release: $TAG" || echo "nothing to commit"
+          git tag "$TAG"
+          git push origin HEAD
+          git push origin "$TAG"
