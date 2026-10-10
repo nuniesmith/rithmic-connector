@@ -23,7 +23,10 @@ edition = "2024"
 rust-version = "1.94.1"
 description = "FKS Rithmic Connector — credential-gated, READ-ONLY futures market-data sidecar (R|Protocol via rithmic-rs)"
 license = "MIT"
-publish = false
+repository = "https://github.com/nuniesmith/rithmic-connector"
+readme = "README.md"
+keywords = ["rithmic", "futures", "market-data", "trading"]
+categories = ["network-programming"]
 
 [lib]
 name = "rithmic_connector"
